@@ -1,0 +1,12 @@
+
+LABEL_NAMES = {
+    0: "Ignore",
+    1: "Background",
+    2: "Building",
+    3: "Road",
+    4: "Water",
+    5: "Barren",
+    6: "Vegetation",
+    7: "Agricultural",
+    8: "Vehicle",
+}

@@ -2,6 +2,10 @@
 
 ## 一、当前版本迭代情况与提升
 
+> 注1：当前为进行 baseline 级别的框架尝试，训练采用同一配置：AdamW、相同初始学习率、Weight decay、Scheduler、optimizer steps = 30000、常规多类别 Cross Entropy Loss。
+> 注2: 数据增强仅采用 水平翻转、垂直翻转、随机 0°/90°/180°/270° 旋转 这几种最简单的数据增强方式
+> 注3: 因时间和资源有限，不保证所有训练均已完全收敛稳定，旨在统一设置下进行架构调整效果对比。
+
 当前完成的 Stage 03 实验包含两个版本：
 
 | 版本 | 模型 | Presence Conditioning | 最佳 step | val_stratified mIoU | val_domain mIoU |
@@ -73,17 +77,106 @@ python -m pip install -r requirements.txt
 
 ### 2. 准备固定数据与 Presence probability
 
-数据目录：
+训练图片和标注放在仓库根目录的 `data/train/` 下。项目文件结构如下：
 
 ```text
-data/train/images/
-data/train/masks/
-data/splits/train.txt
-data/splits/val_stratified.txt
-data/splits/val_domain.txt
+aic_seg/
+├── README.md
+├── requirements.txt
+├── src/
+├── tools/
+├── data/
+│   ├── Label.txt
+│   ├── splits/
+│   │   ├── train.txt
+│   │   ├── val_stratified.txt
+│   │   └── val_domain.txt
+│   └── train/
+│       ├── images/
+│       │   ├── 0000.png
+│       │   ├── 0001.png
+│       │   └── ...
+│       └── masks/
+│           ├── 0000.png
+│           ├── 0001.png
+│           └── ...
+└── outputs/
 ```
 
-Stage 03 使用 Stage 02 导出的预测 probability：
+图片和 mask 使用相同文件名并一一对应：
+
+```text
+data/train/images/<image_id>.png
+data/train/masks/<image_id>.png
+```
+
+三个 split 文件每行保存一个不带 `.png` 后缀的 `image_id`。例如 split 中的 `0000` 对应：
+
+```text
+data/train/images/0000.png
+data/train/masks/0000.png
+```
+
+`data/train/` 和 `outputs/` 不上传到 Git 仓库，由运行环境本地准备或生成。
+
+### 3. 执行完整数据审计
+
+```bash
+python -m tools.audit_data \
+  --data-dir data \
+  --output-dir outputs/data_audit
+```
+
+完整审计通过后生成：
+
+```text
+outputs/data_audit/audit.json
+outputs/data_audit/class_statistics.csv
+```
+
+### 4. 提取 DINOv2 全量 embedding
+
+该步骤读取三个固定 split 中的全部 6,996 张图片，将完整的 1024×1024 图片直接 Resize 到 518×518，再使用冻结的 DINOv2 ViT-B/14 提取 CLS、Mean Patch 和 Combined embedding。
+
+```bash
+python -m tools.extract_dinov2_embeddings \
+  --data-dir data \
+  --audit-file outputs/data_audit/audit.json \
+  --device cuda \
+  --batch-size 1 \
+  --output-dir outputs/dinov2_518/full_cuda
+```
+
+生成文件：
+
+```text
+outputs/dinov2_518/full_cuda/cls.npy
+outputs/dinov2_518/full_cuda/mean_patch.npy
+outputs/dinov2_518/full_cuda/combined.npy
+outputs/dinov2_518/full_cuda/manifest.csv
+outputs/dinov2_518/full_cuda/metadata.json
+```
+
+### 5. 训练 Presence Head 并导出 probability
+
+该步骤使用 `train.txt` 训练线性 Presence Head，使用 `val_stratified.txt` 选择特征、checkpoint 和分类阈值，随后导出三个 split 的预测 probability。
+
+```bash
+python -m tools.run_presence_experiment \
+  --data-dir data \
+  --embedding-dir outputs/dinov2_518/full_cuda \
+  --features all \
+  --device cuda \
+  --batch-size 256 \
+  --max-epochs 100 \
+  --patience 10 \
+  --learning-rate 1e-3 \
+  --weight-decay 1e-4 \
+  --seed 42 \
+  --output-dir outputs/class_presence/linear_518
+```
+
+Stage 03 使用以下三个预测 probability 文件：
 
 ```text
 outputs/class_presence/linear_518/predictions_train.csv
@@ -91,7 +184,16 @@ outputs/class_presence/linear_518/predictions_val_stratified.csv
 outputs/class_presence/linear_518/predictions_val_domain.csv
 ```
 
-### 3. CUDA smoke test
+每个 CSV 的列顺序为：
+
+```text
+image_id, split, Background, Building, Road, Water,
+Barren, Vegetation, Agricultural, Vehicle
+```
+
+Stage 03 Conditioning 从中读取七个前景类别的连续 probability，不读取 Background probability。
+
+### 6. CUDA smoke test
 
 ```bash
 python -m tools.smoke_presence_conditioning \
@@ -99,7 +201,7 @@ python -m tools.smoke_presence_conditioning \
   --output-dir outputs/presence_conditioning/smoke_cuda
 ```
 
-### 4. 训练 v1
+### 7. 训练 v1
 
 ```bash
 python -m tools.train_presence_conditioning \
@@ -116,7 +218,7 @@ python -m tools.train_presence_conditioning \
   --output-dir outputs/presence_conditioning/control_b3_bs4
 ```
 
-### 5. 训练 v2
+### 8. 训练 v2
 
 ```bash
 python -m tools.train_presence_conditioning \
@@ -133,7 +235,7 @@ python -m tools.train_presence_conditioning \
   --output-dir outputs/presence_conditioning/conditioned_b3_bs4
 ```
 
-### 6. 生成对比结果
+### 9. 生成对比结果
 
 ```bash
 python -m tools.compare_presence_conditioning \
@@ -175,7 +277,7 @@ python -m tools.compare_presence_conditioning \
 | 数据增强 | 水平翻转、垂直翻转、随机 0°/90°/180°/270° 旋转 |
 | 最佳 checkpoint | `best.pt`，step 28,000 |
 
-#### 训练loss
+#### 训练 loss：常规 Cross Entropy Loss（无类别权重、无 label smoothing，`ignore_index=255`）
 
 | Step | Train loss | val_stratified mIoU |
 | ---: | ---: | ---: |
@@ -238,7 +340,7 @@ python -m tools.compare_presence_conditioning \
 | 数据增强 | 水平翻转、垂直翻转、随机 0°/90°/180°/270° 旋转 |
 | 最佳 checkpoint | `best.pt`，step 28,000 |
 
-#### 训练loss
+#### 训练 loss：常规 Cross Entropy Loss（无类别权重、无 label smoothing，`ignore_index=255`）
 
 | Step | Train loss | val_stratified mIoU |
 | ---: | ---: | ---: |
