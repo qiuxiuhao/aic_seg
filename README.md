@@ -388,6 +388,41 @@ python -m tools.train_presence_conditioning \
   --resume-from outputs/direct_dino_conditioning/direct_dino_b3_bs4/last.pt
 ```
 
+### 14. 使用 v3 生成比赛提交文件
+
+test 图像目录：
+
+```text
+data/test/images/
+├── test2_1.png
+├── test2_2.png
+└── ...                     # 共 1,300 张 1024×1024 RGB PNG
+```
+
+在 CUDA 环境中使用 v3 的最佳 checkpoint 执行全量推理：
+
+```bash
+python -m tools.infer_v3_submission \
+  --test-image-dir data/test/images \
+  --run-dir outputs/direct_dino_conditioning/direct_dino_b3_bs4 \
+  --device cuda \
+  --amp \
+  --batch-size 1 \
+  --num-workers 0 \
+  --output-dir outputs/submissions/v3_direct_dino_single
+```
+
+推理过程使用完整原始 test 图像生成冻结 DINOv2 Combined 1,536 维特征，并加载 v3 的 `best.pt`。输出结构：
+
+```text
+outputs/submissions/v3_direct_dino_single/
+├── predictions/            # 1,300 张同名、单通道 1024×1024 PNG
+├── submission.zip          # 比赛平台上传文件
+└── submission_report.json  # checkpoint、DINO hash、标签映射、文件数量和 ZIP 校验记录
+```
+
+脚本会先核对 `data/Label.txt` 与内部类别顺序。模型内部类别 `0..7` 会在保存时显式转换为比赛标签 `1..8`。`submission.zip` 中的 PNG 位于压缩包根目录，不包含额外目录层级。
+
 ## 三、baseline版本具体情况
 
 ### v1: SegFormer-B3

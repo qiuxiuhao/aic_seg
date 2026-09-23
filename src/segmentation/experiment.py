@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from src.presence.labels import CLASS_NAMES
+from src.segmentation.dino_moe import RoutingAccumulator
 MODEL_ID = "nvidia/mit-b3"
 
 
@@ -48,10 +49,17 @@ def segmentation_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tenso
     return F.cross_entropy(logits, target, ignore_index=255)
 
 
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, amp: bool) -> dict[str, object]:
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    amp: bool,
+    collect_routing: bool = False,
+) -> dict[str, object]:
     """Count valid pixels only; report all eight IoUs and their mean."""
     model.eval()
     confusion = torch.zeros((8, 8), dtype=torch.int64)
+    routing = RoutingAccumulator() if collect_routing else None
     with torch.inference_mode():
         for batch in tqdm(loader, desc="Evaluating", leave=False):
             if len(batch) not in (4, 5):
@@ -59,7 +67,12 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, amp: bo
             pixels, target, conditioning = batch[:3]
             pixels, conditioning = pixels.to(device), conditioning.to(device)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
-                logits = model(pixels, conditioning)
+                if collect_routing:
+                    logits, weights = model(pixels, conditioning, return_routing=True)
+                else:
+                    logits = model(pixels, conditioning)
+            if routing is not None:
+                routing.update(weights)
             predicted = logits.argmax(dim=1).cpu()
             valid = target != 255
             counts = torch.bincount((target[valid] * 8 + predicted[valid]).view(-1), minlength=64)
@@ -68,12 +81,15 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, amp: bo
     union = confusion.sum(0) + confusion.sum(1) - intersection
     iou = [float(intersection[i] / union[i]) if union[i] else None for i in range(8)]
     valid_iou = [value for value in iou if value is not None]
-    return {
+    result = {
         "miou": float(sum(valid_iou) / len(valid_iou)) if valid_iou else None,
         "class_iou": dict(zip(CLASS_NAMES, iou)),
         "valid_pixels": int(confusion.sum()),
         "confusion": confusion.tolist(),
     }
+    if routing is not None:
+        result["routing"] = routing.summary()
+    return result
 
 
 def save_json(path: Path, value: object) -> None:

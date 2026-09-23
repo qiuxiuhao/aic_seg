@@ -1,4 +1,4 @@
-"""Train a Stage 03/04 SegFormer-B3 arm with the shared fixed protocol."""
+"""Train a Stage 03/04/05 SegFormer-B3 arm with the shared fixed protocol."""
 
 from __future__ import annotations
 
@@ -17,17 +17,22 @@ from src.dino.embedding import select_device
 from src.dino.download import sha256_file
 from src.segmentation.data import SegmentationDataset, load_aligned_presence
 from src.segmentation.dino_conditioning import (
+    DINO_DIM,
     DirectDinoEmbeddingStore,
     DirectDinoSegformer,
     DirectDinoSegmentationDataset,
 )
+from src.segmentation.dino_moe import DinoSoftMoESegformer, RoutingAccumulator
 from src.segmentation.experiment import evaluate, resolve_pretrained, save_json, seed_everything, segmentation_loss
 from src.segmentation.model import PresenceSegformer
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--arm", choices=("control", "conditioned", "direct_dino"), required=True)
+    parser.add_argument(
+        "--arm", choices=("control", "conditioned", "direct_dino", "dino_soft_moe"),
+        required=True,
+    )
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--presence-dir", type=Path, default=Path("outputs/class_presence/linear_518"))
     parser.add_argument("--embedding-dir", type=Path, default=Path("outputs/dinov2_518/full_mps"))
@@ -70,7 +75,7 @@ def parse_args() -> argparse.Namespace:
         if args.resume_from.resolve().parent != args.output_dir.resolve():
             parser.error("Resume checkpoint must belong to --output-dir")
         if args.num_workers != 0:
-            parser.error("Exact Stage 03/04 resume requires --num-workers 0")
+            parser.error("Exact Stage 03/04/05 resume requires --num-workers 0")
     if args.data_dir.resolve() in args.output_dir.resolve().parents:
         parser.error("Output directory cannot be under read-only data/")
     return args
@@ -106,13 +111,17 @@ def save_resume_checkpoint(path: Path, state: dict[str, object]) -> None:
 
 
 def validate_resume_config(args: argparse.Namespace, config: dict[str, object]) -> None:
-    """Reject protocol changes when continuing an existing Stage 03/04 run."""
+    """Reject protocol changes when continuing an existing Stage 03/04/05 run."""
     keys = (
         "arm", "data_dir", "pretrained_dir", "cache_dir", "hf_endpoint",
         "device", "seed", "max_steps", "eval_every", "batch_size", "grad_accum",
         "num_workers", "learning_rate", "weight_decay", "amp",
     )
-    keys += ("embedding_dir", "augmented_dino_dir") if args.arm == "direct_dino" else ("presence_dir",)
+    keys += (
+        ("embedding_dir", "augmented_dino_dir")
+        if args.arm in {"direct_dino", "dino_soft_moe"}
+        else ("presence_dir",)
+    )
     for key in keys:
         actual = getattr(args, key)
         if isinstance(actual, Path):
@@ -123,6 +132,44 @@ def validate_resume_config(args: argparse.Namespace, config: dict[str, object]) 
             )
 
 
+@torch.inference_mode()
+def evaluate_embedding_store_routing(
+    model: DinoSoftMoESegformer,
+    store: DirectDinoEmbeddingStore,
+    split: str,
+    device: torch.device,
+    amp: bool,
+    batch_size: int = 1024,
+) -> dict[str, object]:
+    """Measure router utilization directly over cached embeddings at the best checkpoint."""
+    model.eval()
+    accumulator = RoutingAccumulator()
+    if split == "train":
+        embeddings = store.augmented.reshape(-1, DINO_DIM)
+        count = embeddings.shape[0]
+
+        def batch_at(start: int) -> np.ndarray:
+            return np.asarray(embeddings[start : start + batch_size]).copy()
+    else:
+        ids = store.split_ids[split]
+        count = len(ids)
+
+        def batch_at(start: int) -> np.ndarray:
+            group = ids[start : start + batch_size]
+            return np.stack([store.embedding(image_id, split, "r0") for image_id in group])
+
+    for start in range(0, count, batch_size):
+        batch = torch.from_numpy(batch_at(start)).to(device)
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
+            weights = model.routing_weights(batch)
+        accumulator.update(weights)
+    summary = accumulator.summary()
+    summary["embedding_distribution"] = (
+        "all 8 canonical train states per image" if split == "train" else "original r0"
+    )
+    return summary
+
+
 def main() -> int:
     args = parse_args()
     device = select_device(args.device)
@@ -130,7 +177,9 @@ def main() -> int:
         raise ValueError("--amp currently supports CUDA only")
     pretrained_dir = resolve_pretrained(args.pretrained_dir, args.cache_dir, args.hf_endpoint)
     seed_everything(args.seed)
-    if args.arm == "direct_dino":
+    dino_arm = args.arm in {"direct_dino", "dino_soft_moe"}
+    moe_arm = args.arm == "dino_soft_moe"
+    if dino_arm:
         dino_store = DirectDinoEmbeddingStore(
             args.data_dir, args.embedding_dir, args.augmented_dino_dir, require_full_augmented=True
         )
@@ -141,7 +190,10 @@ def main() -> int:
             for split in ("train", "val_stratified", "val_domain")
         }
         split_counts = {split: len(dataset) for split, dataset in datasets.items()}
-        model = DirectDinoSegformer(str(pretrained_dir)).to(device)
+        model = (
+            DinoSoftMoESegformer(str(pretrained_dir))
+            if moe_arm else DirectDinoSegformer(str(pretrained_dir))
+        ).to(device)
     else:
         aligned = load_aligned_presence(args.data_dir, args.presence_dir)
         datasets = {
@@ -175,7 +227,7 @@ def main() -> int:
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items() if key != "resume_from"
         }
-        if args.arm == "direct_dino":
+        if dino_arm:
             serialized_args.pop("presence_dir")
         else:
             serialized_args.pop("embedding_dir")
@@ -202,7 +254,7 @@ def main() -> int:
                 split: sha256_file(args.data_dir / "splits" / f"{split}.txt") for split in split_counts
             },
         }
-        if args.arm == "direct_dino":
+        if dino_arm:
             run_metadata.update({
                 "dino_source": "Stage 01 accepted Combined CLS || MeanPatch embeddings",
                 "dino_model": "facebook/dinov2-base",
@@ -214,6 +266,27 @@ def main() -> int:
                 "base_embedding_metadata_sha256": sha256_file(args.embedding_dir / "metadata.json"),
                 "augmented_embedding_metadata_sha256": sha256_file(args.augmented_dino_dir / "metadata.json"),
             })
+            if moe_arm:
+                run_metadata.update({
+                    "initialization_strategy": "nvidia/mit-b3 start; Stage 04 best.pt is not loaded",
+                    "moe_type": "DINO-conditioned dense soft routing",
+                    "num_experts": 4,
+                    "router_architecture": "LayerNorm -> Linear 1536->256 -> GELU -> Linear 256->4 -> Softmax",
+                    "expert_architecture": "Conv1x1 768->192 -> GELU -> Conv1x1 192->768",
+                    "expert_output_initialization": "normal std=1e-5; zero bias",
+                    "moe_residual": "F_moe = F_film + sum_i(w_i * E_i(F_film))",
+                    "routing": "all four experts execute; no Top-k or hard routing",
+                    "router_regularization": None,
+                    "moe_parameter_count": sum(
+                        parameter.numel() for parameter in model.moe.parameters()
+                    ),
+                    "router_parameter_count": sum(
+                        parameter.numel() for parameter in model.moe.router.parameters()
+                    ),
+                    "expert_parameter_count_each": sum(
+                        parameter.numel() for parameter in model.moe.experts[0].parameters()
+                    ),
+                })
         else:
             run_metadata.update({
                 "presence_source": "Stage 02 predicted probabilities; train is in-sample prediction",
@@ -235,6 +308,8 @@ def main() -> int:
     best_miou = -1.0
     best_step = 0
     history: list[dict[str, float | int | None]] = []
+    routing_history: list[dict[str, object]] = []
+    train_routing = RoutingAccumulator() if moe_arm else None
     start_step = 0
     iterator_start_generator_state = loader_generator.get_state()
     iterator = iter(train_loader)
@@ -247,9 +322,11 @@ def main() -> int:
             "torch_rng_state", "loader_generator_state", "iterator_start_generator_state",
             "batches_in_iterator",
         }
+        if moe_arm:
+            required.add("routing_history")
         missing = required - checkpoint.keys()
         if missing or checkpoint["schema_version"] != 1 or checkpoint["arm"] != args.arm:
-            raise ValueError(f"Invalid Stage 03/04 resume checkpoint; missing={sorted(missing)}")
+            raise ValueError(f"Invalid Stage 03/04/05 resume checkpoint; missing={sorted(missing)}")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -257,6 +334,8 @@ def main() -> int:
         best_miou = float(checkpoint["best_miou"])
         best_step = int(checkpoint["best_step"])
         history = list(checkpoint["history"])
+        if moe_arm:
+            routing_history = list(checkpoint["routing_history"])
         start_step = int(checkpoint["step"])
         if start_step >= args.max_steps:
             raise ValueError(f"Run already reached max_steps={args.max_steps}")
@@ -294,8 +373,13 @@ def main() -> int:
             pixels, target, conditioning = batch[:3]
             pixels, target, conditioning = pixels.to(device), target.to(device), conditioning.to(device)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp):
-                logits = model(pixels, conditioning)
+                if moe_arm:
+                    logits, routing_weights = model(pixels, conditioning, return_routing=True)
+                else:
+                    logits = model(pixels, conditioning)
                 loss = segmentation_loss(logits, target) / args.grad_accum
+            if train_routing is not None:
+                train_routing.update(routing_weights)
             if not torch.isfinite(loss):
                 raise ValueError(f"Non-finite loss at step {step}")
             scaler.scale(loss).backward()
@@ -304,12 +388,23 @@ def main() -> int:
         scaler.update()
         scheduler.step()
         if step % args.eval_every == 0 or step == args.max_steps:
-            val = evaluate(model, val_loader, device, args.amp)
+            val = evaluate(model, val_loader, device, args.amp, collect_routing=moe_arm)
             score = val["miou"]
             if score is None:
                 raise ValueError("Validation has no valid semantic pixels")
             history.append({"step": step, "train_loss": loss_total, "val_stratified_miou": score})
             save_json(args.output_dir / "history.json", history)
+            if train_routing is not None:
+                routing_history.append({
+                    "step": step,
+                    "train_observed_batches": train_routing.summary(),
+                    "val_stratified": val["routing"],
+                })
+                save_json(args.output_dir / "routing_statistics.json", {
+                    "history": routing_history,
+                    "final_best": None,
+                })
+                train_routing = RoutingAccumulator()
             print(f"step={step} train_loss={loss_total:.4f} val_stratified_mIoU={score:.4f}", flush=True)
             if score > best_miou:
                 best_miou, best_step = score, step
@@ -325,6 +420,7 @@ def main() -> int:
                 "best_miou": best_miou,
                 "best_step": best_step,
                 "history": history,
+                "routing_history": routing_history if moe_arm else [],
                 "python_rng_state": random.getstate(),
                 "numpy_rng_state": numpy_rng_state(),
                 "torch_rng_state": torch.get_rng_state(),
@@ -335,13 +431,28 @@ def main() -> int:
             })
     checkpoint = torch.load(args.output_dir / "best.pt", map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model"])
+    val_metrics = evaluate(model, val_loader, device, args.amp, collect_routing=moe_arm)
+    domain_metrics = evaluate(model, domain_loader, device, args.amp, collect_routing=moe_arm)
     metrics = {
         "arm": args.arm, "best_step": best_step,
         "checkpoint_selection": "maximum val_stratified mIoU only",
-        "val_stratified": evaluate(model, val_loader, device, args.amp),
-        "val_domain": evaluate(model, domain_loader, device, args.amp),
+        "val_stratified": val_metrics,
+        "val_domain": domain_metrics,
     }
     save_json(args.output_dir / "metrics.json", metrics)
+    if moe_arm:
+        final_routing = {
+            "checkpoint_step": best_step,
+            "train": evaluate_embedding_store_routing(
+                model, dino_store, "train", device, args.amp
+            ),
+            "val_stratified": val_metrics["routing"],
+            "val_domain": domain_metrics["routing"],
+        }
+        save_json(args.output_dir / "routing_statistics.json", {
+            "history": routing_history,
+            "final_best": final_routing,
+        })
     print(f"Saved {args.output_dir / 'metrics.json'}", flush=True)
     return 0
 

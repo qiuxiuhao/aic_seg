@@ -239,11 +239,10 @@ class DirectDinoSegformer(nn.Module):
         self.decode_head = SegformerDecodeHead(config)
         self.film = DirectDinoFiLM(config.decoder_hidden_size, hidden=256)
 
-    def forward(self, pixels: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
+    def decode_feature(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Return the same 768-channel fused decoder feature used by Stage 04."""
         if pixels.ndim != 4 or pixels.shape[1] != 3:
             raise ValueError("Pixels must have shape [B, 3, H, W]")
-        if embedding.shape != (pixels.shape[0], DINO_DIM):
-            raise ValueError("DINO Combined embedding must have shape [B, 1536]")
         states = self.encoder(pixels, output_hidden_states=True).hidden_states
         fused = []
         output_size = states[0].shape[-2:]
@@ -253,7 +252,16 @@ class DirectDinoSegformer(nn.Module):
             fused.append(F.interpolate(feature, size=output_size, mode="bilinear", align_corners=False))
         feature = self.decode_head.linear_fuse(torch.cat(fused[::-1], dim=1))
         feature = self.decode_head.activation(self.decode_head.batch_norm(feature))
-        feature = self.decode_head.dropout(feature)
-        feature = self.film(feature, embedding)
+        return self.decode_head.dropout(feature)
+
+    def classify_feature(self, feature: torch.Tensor, output_size: tuple[int, int]) -> torch.Tensor:
+        """Apply the shared eight-class head and restore segmentation resolution."""
         logits = self.decode_head.classifier(feature)
-        return F.interpolate(logits, size=pixels.shape[-2:], mode="bilinear", align_corners=False)
+        return F.interpolate(logits, size=output_size, mode="bilinear", align_corners=False)
+
+    def forward(self, pixels: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
+        if embedding.shape != (pixels.shape[0], DINO_DIM):
+            raise ValueError("DINO Combined embedding must have shape [B, 1536]")
+        feature = self.decode_feature(pixels)
+        feature = self.film(feature, embedding)
+        return self.classify_feature(feature, pixels.shape[-2:])
