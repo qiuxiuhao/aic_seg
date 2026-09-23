@@ -8,42 +8,46 @@
 
 > 注3: 因时间和资源有限，不保证所有训练均已完全收敛稳定，旨在统一设置下进行架构调整效果对比。
 
-当前完成的 Stage 03 实验包含两个版本：
+当前完成的 Stage 03 和 Stage 04 实验包含三个版本：
 
-| 版本 | 模型 | Presence Conditioning | 最佳 step | val_stratified mIoU | val_domain mIoU |
+| 版本 | 模型 | Conditioning | 最佳 step | val_stratified mIoU | val_domain mIoU |
 | --- | --- | --- | ---: | ---: | ---: |
-| v1 | SegFormer-B3 | 关闭 | 28,000 | 74.6640% | 68.9888% |
-| v2 | SegFormer-B3 + Presence Conditioning | 开启 | 28,000 | 74.6940% | 69.6476% |
+| v1 | SegFormer-B3 | 无 | 28,000 | 74.6640% | 68.9888% |
+| v2 | SegFormer-B3 + Presence Conditioning | Presence probability | 28,000 | 74.6940% | 69.6476% |
+| v3 | SegFormer-B3 + Direct DINO Conditioning | DINO Combined embedding | 28,000 | 75.1535% | 69.9629% |
 | v2 - v1 | — | — | — | +0.0299 pp | +0.6588 pp |
+| v3 - v1 | — | — | — | +0.4894 pp | +0.9742 pp |
+| v3 - v2 | — | — | — | +0.4595 pp | +0.3154 pp |
 
-两个版本的 checkpoint 均只按照 `val_stratified` mIoU 选择。`val_domain` 不参与 checkpoint 选择。
+三个版本的 checkpoint 均只按照 `val_stratified` mIoU 选择。`val_domain` 不参与 checkpoint 选择。
 
 各类别 IoU：
 
-| 数据集 | 类别 | v1 | v2 | v2 - v1 |
-| --- | --- | ---: | ---: | ---: |
-| val_stratified | Background | 66.7450% | 66.8950% | +0.1500 pp |
-| val_stratified | Building | 85.6661% | 85.9595% | +0.2934 pp |
-| val_stratified | Road | 78.8383% | 79.1101% | +0.2718 pp |
-| val_stratified | Water | 85.3687% | 85.2992% | -0.0695 pp |
-| val_stratified | Barren | 39.3018% | 39.1525% | -0.1493 pp |
-| val_stratified | Vegetation | 85.6111% | 85.5968% | -0.0143 pp |
-| val_stratified | Agricultural | 78.5599% | 78.3958% | -0.1641 pp |
-| val_stratified | Vehicle | 77.2215% | 77.1428% | -0.0786 pp |
-| val_domain | Background | 69.4301% | 69.8004% | +0.3704 pp |
-| val_domain | Building | 82.9688% | 82.8927% | -0.0761 pp |
-| val_domain | Road | 75.5821% | 75.2794% | -0.3027 pp |
-| val_domain | Water | 70.2525% | 71.6820% | +1.4294 pp |
-| val_domain | Barren | 58.8264% | 60.4940% | +1.6677 pp |
-| val_domain | Vegetation | 83.0794% | 83.4941% | +0.4147 pp |
-| val_domain | Agricultural | 35.7729% | 37.4464% | +1.6736 pp |
-| val_domain | Vehicle | 75.9981% | 76.0915% | +0.0934 pp |
+| 数据集 | 类别 | v1 | v2 | v3 | v2 - v1 | v3 - v1 | v3 - v2 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| val_stratified | Background | 66.7450% | 66.8950% | 67.3464% | +0.1500 pp | +0.6014 pp | +0.4514 pp |
+| val_stratified | Building | 85.6661% | 85.9595% | 85.6580% | +0.2934 pp | -0.0081 pp | -0.3015 pp |
+| val_stratified | Road | 78.8383% | 79.1101% | 79.2987% | +0.2718 pp | +0.4604 pp | +0.1886 pp |
+| val_stratified | Water | 85.3687% | 85.2992% | 85.2983% | -0.0695 pp | -0.0703 pp | -0.0009 pp |
+| val_stratified | Barren | 39.3018% | 39.1525% | 40.7432% | -0.1493 pp | +1.4415 pp | +1.5908 pp |
+| val_stratified | Vegetation | 85.6111% | 85.5968% | 86.0248% | -0.0143 pp | +0.4137 pp | +0.4280 pp |
+| val_stratified | Agricultural | 78.5599% | 78.3958% | 78.6291% | -0.1641 pp | +0.0692 pp | +0.2333 pp |
+| val_stratified | Vehicle | 77.2215% | 77.1428% | 78.2290% | -0.0786 pp | +1.0076 pp | +1.0862 pp |
+| val_domain | Background | 69.4301% | 69.8004% | 69.3696% | +0.3704 pp | -0.0605 pp | -0.4309 pp |
+| val_domain | Building | 82.9688% | 82.8927% | 83.0501% | -0.0761 pp | +0.0813 pp | +0.1574 pp |
+| val_domain | Road | 75.5821% | 75.2794% | 76.4606% | -0.3027 pp | +0.8785 pp | +1.1812 pp |
+| val_domain | Water | 70.2525% | 71.6820% | 73.3733% | +1.4294 pp | +3.1208 pp | +1.6914 pp |
+| val_domain | Barren | 58.8264% | 60.4940% | 60.2623% | +1.6677 pp | +1.4360 pp | -0.2317 pp |
+| val_domain | Vegetation | 83.0794% | 83.4941% | 83.1754% | +0.4147 pp | +0.0960 pp | -0.3187 pp |
+| val_domain | Agricultural | 35.7729% | 37.4464% | 36.8916% | +1.6736 pp | +1.1187 pp | -0.5549 pp |
+| val_domain | Vehicle | 75.9981% | 76.0915% | 77.1206% | +0.0934 pp | +1.1225 pp | +1.0291 pp |
 
 正式输出目录：
 
 ```text
 outputs/presence_conditioning/control_b3_bs4/
 outputs/presence_conditioning/conditioned_b3_bs4/
+outputs/direct_dino_conditioning/direct_dino_b3_bs4/
 ```
 
 每个目录包含：
@@ -79,7 +83,7 @@ CUDA
 python -m pip install -r requirements.txt
 ```
 
-### 2. 准备固定数据与 Presence probability
+### 2. 准备固定数据
 
 训练图片和标注放在仓库根目录的 `data/train/` 下。项目文件结构如下：
 
@@ -297,13 +301,91 @@ python -m tools.train_presence_conditioning \
   --resume-from outputs/presence_conditioning/conditioned_b3_bs4/last.pt
 ```
 
-### 10. 生成对比结果
+### 10. 生成 Stage 04 几何增强 DINO cache
+
+Stage 04 固定使用 Stage 01 的 Combined embedding（CLS 768 + Mean Patch 768，共 1536 维）。训练集为每个 image ID 保存 8 个唯一几何状态，`r0` 直接复用 Stage 01 embedding，其余 7 个状态使用冻结的 DINOv2 ViT-B/14 离线提取。
 
 ```bash
-python -m tools.compare_presence_conditioning \
-  --control-dir outputs/presence_conditioning/control_b3_bs4 \
-  --conditioned-dir outputs/presence_conditioning/conditioned_b3_bs4 \
-  --output docs/results/03_presence_conditioning_results.md
+python -m tools.cache_augmented_dino_embeddings \
+  --data-dir data \
+  --base-embedding-dir outputs/dinov2_518/full_mps \
+  --cache-dir outputs/hf_cache \
+  --device cuda \
+  --batch-size 16 \
+  --output-dir outputs/dinov2_518/augmented_train
+```
+
+完整输出的 Combined 数组 shape 为：
+
+```text
+[5597, 8, 1536]
+```
+
+8 个状态为：
+
+```text
+r0
+r90
+r180
+r270
+flip_r0
+flip_r90
+flip_r180
+flip_r270
+```
+
+### 11. Stage 04 smoke test
+
+```bash
+python -m tools.smoke_direct_dino_conditioning \
+  --data-dir data \
+  --embedding-dir outputs/dinov2_518/full_mps \
+  --augmented-dino-dir outputs/dinov2_518/augmented_train \
+  --device cuda \
+  --output-dir outputs/direct_dino_conditioning/smoke_cuda
+```
+
+### 12. 训练 v3 Direct DINO Conditioning
+
+```bash
+python -m tools.train_presence_conditioning \
+  --arm direct_dino \
+  --data-dir data \
+  --embedding-dir outputs/dinov2_518/full_mps \
+  --augmented-dino-dir outputs/dinov2_518/augmented_train \
+  --device cuda \
+  --amp \
+  --max-steps 30000 \
+  --eval-every 2000 \
+  --batch-size 4 \
+  --grad-accum 1 \
+  --num-workers 0 \
+  --learning-rate 6e-5 \
+  --weight-decay 0.01 \
+  --seed 42 \
+  --output-dir outputs/direct_dino_conditioning/direct_dino_b3_bs4
+```
+
+### 13. Stage 04 断点续训
+
+```bash
+python -m tools.train_presence_conditioning \
+  --arm direct_dino \
+  --data-dir data \
+  --embedding-dir outputs/dinov2_518/full_mps \
+  --augmented-dino-dir outputs/dinov2_518/augmented_train \
+  --device cuda \
+  --amp \
+  --max-steps 30000 \
+  --eval-every 2000 \
+  --batch-size 4 \
+  --grad-accum 1 \
+  --num-workers 0 \
+  --learning-rate 6e-5 \
+  --weight-decay 0.01 \
+  --seed 42 \
+  --output-dir outputs/direct_dino_conditioning/direct_dino_b3_bs4 \
+  --resume-from outputs/direct_dino_conditioning/direct_dino_b3_bs4/last.pt
 ```
 
 ## 三、baseline版本具体情况
@@ -421,3 +503,70 @@ python -m tools.compare_presence_conditioning \
 | 26,000 | 0.113745 | 74.6554% |
 | 28,000 | 0.307231 | 74.6940% |
 | 30,000 | 0.130804 | 74.6766% |
+
+### v3: SegFormer-B3 + Direct DINO Conditioning
+
+#### 训练配置
+
+| 配置项 | 数值 |
+| --- | --- |
+| 模型 | SegFormer-B3 |
+| 预训练模型 | `nvidia/mit-b3` |
+| Direct DINO Conditioning | 开启 |
+| DINO 特征来源 | Stage 01 DINOv2 Combined embedding |
+| DINOv2 模型 | `facebook/dinov2-base`，ViT-B/14，冻结，离线提取 |
+| DINOv2 输入 | 完整 1024×1024 图像直接 Resize 到 518×518 |
+| DINOv2 CLS 维度 | 768 |
+| DINOv2 Mean Patch 维度 | 768 |
+| DINOv2 Combined 维度 | 1,536 |
+| 训练集 DINO cache | 每个 image ID 对应 8 个几何 transform state |
+| 训练集 transform state | `r0`、`r90`、`r180`、`r270`、`flip_r0`、`flip_r90`、`flip_r180`、`flip_r270` |
+| 验证集 DINO embedding | 原始完整图像 `r0` embedding |
+| Conditioning | LayerNorm，`1536 → 256 → 1536` |
+| Conditioning 激活函数 | GELU |
+| Conditioning 参数量 | 791,296 |
+| 模型可训练参数量 | 48,019,912 |
+| FiLM 输出 | 768 维 gamma + 768 维 beta |
+| FiLM 计算 | `F' = (1 + gamma) * F + beta` |
+| FiLM 注入位置 | SegFormer decoder fused feature 与 classifier 之间 |
+| 训练集 | `data/splits/train.txt`，5,597 张 |
+| 主验证集 | `data/splits/val_stratified.txt`，700 张 |
+| 泛化验证集 | `data/splits/val_domain.txt`，699 张 |
+| 分割输入 | 完整 RGB 图像，1024×1024 |
+| 分割类别 | 8 |
+| Ignore index | 255 |
+| Loss | Cross Entropy |
+| 优化器 | AdamW |
+| 初始学习率 | `6e-5` |
+| Weight decay | `0.01` |
+| Scheduler | CosineAnnealingLR，`T_max=30000` |
+| Optimizer steps | 30,000 |
+| 验证间隔 | 2,000 steps |
+| Batch size | 4 |
+| Gradient accumulation | 1 |
+| 有效 batch size | 4 |
+| AMP | CUDA FP16 |
+| Gradient checkpointing | 开启 |
+| 随机种子 | 42 |
+| 数据增强 | 水平翻转、垂直翻转、随机 0°/90°/180°/270° 旋转 |
+| 最佳 checkpoint | `best.pt`，step 28,000 |
+
+#### 训练 loss：常规 Cross Entropy Loss（无类别权重、无 label smoothing，`ignore_index=255`）
+
+| Step | Train loss | val_stratified mIoU |
+| ---: | ---: | ---: |
+| 2,000 | 0.896250 | 63.2269% |
+| 4,000 | 0.416938 | 66.9397% |
+| 6,000 | 0.156465 | 68.8650% |
+| 8,000 | 0.203638 | 69.8081% |
+| 10,000 | 0.159549 | 71.3690% |
+| 12,000 | 0.083413 | 71.8376% |
+| 14,000 | 0.213179 | 72.7105% |
+| 16,000 | 0.075330 | 73.6717% |
+| 18,000 | 0.194961 | 74.2285% |
+| 20,000 | 0.162203 | 74.7492% |
+| 22,000 | 0.108852 | 74.7240% |
+| 24,000 | 0.140542 | 74.9821% |
+| 26,000 | 0.097219 | 75.0984% |
+| 28,000 | 0.263647 | 75.1535% |
+| 30,000 | 0.110888 | 75.1082% |

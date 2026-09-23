@@ -15,9 +15,6 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from src.presence.labels import CLASS_NAMES
-from src.segmentation.model import PresenceSegformer
-
-
 MODEL_ID = "nvidia/mit-b3"
 
 
@@ -51,15 +48,18 @@ def segmentation_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tenso
     return F.cross_entropy(logits, target, ignore_index=255)
 
 
-def evaluate(model: PresenceSegformer, loader: DataLoader, device: torch.device, amp: bool) -> dict[str, object]:
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, amp: bool) -> dict[str, object]:
     """Count valid pixels only; report all eight IoUs and their mean."""
     model.eval()
     confusion = torch.zeros((8, 8), dtype=torch.int64)
     with torch.inference_mode():
-        for pixels, target, probability, _ in tqdm(loader, desc="Evaluating", leave=False):
-            pixels, probability = pixels.to(device), probability.to(device)
+        for batch in tqdm(loader, desc="Evaluating", leave=False):
+            if len(batch) not in (4, 5):
+                raise ValueError(f"Expected a Stage 03/04 batch with 4 or 5 items, got {len(batch)}")
+            pixels, target, conditioning = batch[:3]
+            pixels, conditioning = pixels.to(device), conditioning.to(device)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
-                logits = model(pixels, probability)
+                logits = model(pixels, conditioning)
             predicted = logits.argmax(dim=1).cpu()
             valid = target != 255
             counts = torch.bincount((target[valid] * 8 + predicted[valid]).view(-1), minlength=64)

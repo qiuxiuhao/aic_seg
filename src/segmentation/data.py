@@ -12,12 +12,36 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from src.presence.labels import CLASS_NAMES, SPLITS
+from src.segmentation.geometry import apply_stage03_geometry
 
 
 FOREGROUND_NAMES = CLASS_NAMES[1:]
 IMAGE_SIZE = (1024, 1024)
 MEAN = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
 STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
+
+
+def load_image_mask(data_dir: Path, image_id: str) -> tuple[np.ndarray, np.ndarray]:
+    """Read one immutable full-resolution image/mask pair and validate it."""
+    with Image.open(data_dir / "train" / "images" / f"{image_id}.png") as file:
+        image = np.asarray(file.convert("RGB"), dtype=np.uint8).copy()
+    with Image.open(data_dir / "train" / "masks" / f"{image_id}.png") as file:
+        mask = np.asarray(file, dtype=np.uint8).copy()
+    if image.shape != (*IMAGE_SIZE, 3) or mask.shape != IMAGE_SIZE:
+        raise ValueError(f"{image_id}: expected 1024x1024 image and mask")
+    if np.any(mask > 8):
+        raise ValueError(f"{image_id}: mask contains invalid class ID")
+    return image, mask
+
+
+def encode_image_mask(image: np.ndarray, mask: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Stage 03 normalization and convert raw labels to train targets."""
+    pixels = (image.astype(np.float32) / 255.0 - MEAN) / STD
+    target = np.where(mask == 0, 255, mask.astype(np.int64) - 1)
+    return (
+        torch.from_numpy(np.ascontiguousarray(pixels.transpose(2, 0, 1))),
+        torch.from_numpy(np.ascontiguousarray(target)),
+    )
 
 
 def load_aligned_presence(data_dir: Path, presence_dir: Path) -> dict[str, list[tuple[str, np.ndarray]]]:
@@ -75,26 +99,13 @@ class SegmentationDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
         image_id, probabilities = self.rows[index]
-        with Image.open(self.data_dir / "train" / "images" / f"{image_id}.png") as file:
-            image = np.asarray(file.convert("RGB"), dtype=np.uint8).copy()
-        with Image.open(self.data_dir / "train" / "masks" / f"{image_id}.png") as file:
-            mask = np.asarray(file, dtype=np.uint8).copy()
-        if image.shape != (*IMAGE_SIZE, 3) or mask.shape != IMAGE_SIZE:
-            raise ValueError(f"{image_id}: expected 1024x1024 image and mask")
-        if np.any(mask > 8):
-            raise ValueError(f"{image_id}: mask contains invalid class ID")
+        image, mask = load_image_mask(self.data_dir, image_id)
         if self.augment:
-            if random.random() < 0.5:
-                image, mask = np.flip(image, 1), np.flip(mask, 1)
-            if random.random() < 0.5:
-                image, mask = np.flip(image, 0), np.flip(mask, 0)
-            turns = random.randrange(4)
-            image, mask = np.rot90(image, turns), np.rot90(mask, turns)
-        pixels = (image.astype(np.float32) / 255.0 - MEAN) / STD
-        target = np.where(mask == 0, 255, mask.astype(np.int64) - 1)
+            image, mask, _ = apply_stage03_geometry(image, mask, random)
+        pixels, target = encode_image_mask(image, mask)
         return (
-            torch.from_numpy(np.ascontiguousarray(pixels.transpose(2, 0, 1))),
-            torch.from_numpy(np.ascontiguousarray(target)),
+            pixels,
+            target,
             torch.from_numpy(probabilities.copy()),
             image_id,
         )

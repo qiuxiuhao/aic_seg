@@ -76,18 +76,28 @@ def load_frozen_model(
     return model, processor
 
 
-def preprocess_image(path: Path, processor: ProcessorConfig) -> torch.Tensor:
-    """Resize the whole image directly to 518; apply official channel normalization."""
-    with Image.open(path) as image:
-        if image.size != SOURCE_SIZE or image.mode != "RGB":
-            raise ValueError(f"Expected 1024x1024 RGB image: {path}")
-        resized = image.resize(INPUT_SIZE, resample=Image.Resampling.BICUBIC)
-        rgb = np.asarray(resized, dtype=np.float32)
+def preprocess_rgb(rgb: np.ndarray, processor: ProcessorConfig) -> torch.Tensor:
+    """Resize one complete RGB array to 518 and apply official normalization."""
+    if rgb.shape != (*SOURCE_SIZE, 3) or rgb.dtype != np.uint8:
+        raise ValueError(f"Expected uint8 RGB array with shape (1024, 1024, 3), got {rgb.shape} {rgb.dtype}")
+    resized = Image.fromarray(np.ascontiguousarray(rgb), mode="RGB").resize(
+        INPUT_SIZE, resample=Image.Resampling.BICUBIC
+    )
+    rgb = np.asarray(resized, dtype=np.float32)
     rgb *= float(processor.rescale_factor)
     mean = np.asarray(processor.image_mean, dtype=np.float32)
     std = np.asarray(processor.image_std, dtype=np.float32)
     rgb = (rgb - mean) / std
     return torch.from_numpy(rgb.transpose(2, 0, 1).copy())
+
+
+def preprocess_image(path: Path, processor: ProcessorConfig) -> torch.Tensor:
+    """Resize the whole image directly to 518; apply official channel normalization."""
+    with Image.open(path) as image:
+        if image.size != SOURCE_SIZE or image.mode != "RGB":
+            raise ValueError(f"Expected 1024x1024 RGB image: {path}")
+        rgb = np.asarray(image, dtype=np.uint8).copy()
+    return preprocess_rgb(rgb, processor)
 
 
 @torch.inference_mode()

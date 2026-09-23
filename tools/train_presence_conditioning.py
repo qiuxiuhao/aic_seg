@@ -1,4 +1,4 @@
-"""Train one Stage 03 SegFormer-B3 arm with fixed splits and predicted presence."""
+"""Train a Stage 03/04 SegFormer-B3 arm with the shared fixed protocol."""
 
 from __future__ import annotations
 
@@ -16,15 +16,24 @@ from tqdm.auto import tqdm
 from src.dino.embedding import select_device
 from src.dino.download import sha256_file
 from src.segmentation.data import SegmentationDataset, load_aligned_presence
+from src.segmentation.dino_conditioning import (
+    DirectDinoEmbeddingStore,
+    DirectDinoSegformer,
+    DirectDinoSegmentationDataset,
+)
 from src.segmentation.experiment import evaluate, resolve_pretrained, save_json, seed_everything, segmentation_loss
 from src.segmentation.model import PresenceSegformer
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--arm", choices=("control", "conditioned"), required=True)
+    parser.add_argument("--arm", choices=("control", "conditioned", "direct_dino"), required=True)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--presence-dir", type=Path, default=Path("outputs/class_presence/linear_518"))
+    parser.add_argument("--embedding-dir", type=Path, default=Path("outputs/dinov2_518/full_mps"))
+    parser.add_argument(
+        "--augmented-dino-dir", type=Path, default=Path("outputs/dinov2_518/augmented_train")
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--pretrained-dir", type=Path, default=None)
     parser.add_argument("--cache-dir", type=Path, default=Path("outputs/hf_cache"))
@@ -61,7 +70,7 @@ def parse_args() -> argparse.Namespace:
         if args.resume_from.resolve().parent != args.output_dir.resolve():
             parser.error("Resume checkpoint must belong to --output-dir")
         if args.num_workers != 0:
-            parser.error("Exact Stage 03 resume requires --num-workers 0")
+            parser.error("Exact Stage 03/04 resume requires --num-workers 0")
     if args.data_dir.resolve() in args.output_dir.resolve().parents:
         parser.error("Output directory cannot be under read-only data/")
     return args
@@ -97,12 +106,13 @@ def save_resume_checkpoint(path: Path, state: dict[str, object]) -> None:
 
 
 def validate_resume_config(args: argparse.Namespace, config: dict[str, object]) -> None:
-    """Reject protocol changes when continuing an existing Stage 03 run."""
+    """Reject protocol changes when continuing an existing Stage 03/04 run."""
     keys = (
-        "arm", "data_dir", "presence_dir", "pretrained_dir", "cache_dir", "hf_endpoint",
+        "arm", "data_dir", "pretrained_dir", "cache_dir", "hf_endpoint",
         "device", "seed", "max_steps", "eval_every", "batch_size", "grad_accum",
         "num_workers", "learning_rate", "weight_decay", "amp",
     )
+    keys += ("embedding_dir", "augmented_dino_dir") if args.arm == "direct_dino" else ("presence_dir",)
     for key in keys:
         actual = getattr(args, key)
         if isinstance(actual, Path):
@@ -115,26 +125,44 @@ def validate_resume_config(args: argparse.Namespace, config: dict[str, object]) 
 
 def main() -> int:
     args = parse_args()
-    aligned = load_aligned_presence(args.data_dir, args.presence_dir)
     device = select_device(args.device)
     if args.amp and device.type != "cuda":
         raise ValueError("--amp currently supports CUDA only")
     pretrained_dir = resolve_pretrained(args.pretrained_dir, args.cache_dir, args.hf_endpoint)
     seed_everything(args.seed)
-    model = PresenceSegformer(str(pretrained_dir), args.arm == "conditioned").to(device)
+    if args.arm == "direct_dino":
+        dino_store = DirectDinoEmbeddingStore(
+            args.data_dir, args.embedding_dir, args.augmented_dino_dir, require_full_augmented=True
+        )
+        datasets = {
+            split: DirectDinoSegmentationDataset(
+                args.data_dir, split, dino_store, augment=split == "train"
+            )
+            for split in ("train", "val_stratified", "val_domain")
+        }
+        split_counts = {split: len(dataset) for split, dataset in datasets.items()}
+        model = DirectDinoSegformer(str(pretrained_dir)).to(device)
+    else:
+        aligned = load_aligned_presence(args.data_dir, args.presence_dir)
+        datasets = {
+            split: SegmentationDataset(args.data_dir, aligned[split], augment=split == "train")
+            for split in ("train", "val_stratified", "val_domain")
+        }
+        split_counts = {split: len(rows) for split, rows in aligned.items()}
+        model = PresenceSegformer(str(pretrained_dir), args.arm == "conditioned").to(device)
     model.encoder.gradient_checkpointing_enable()
     loader_generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
-        SegmentationDataset(args.data_dir, aligned["train"], augment=True),
+        datasets["train"],
         batch_size=args.batch_size, shuffle=True, generator=loader_generator,
         num_workers=args.num_workers, pin_memory=device.type == "cuda",
     )
     val_loader = DataLoader(
-        SegmentationDataset(args.data_dir, aligned["val_stratified"], augment=False),
+        datasets["val_stratified"],
         batch_size=1, num_workers=args.num_workers,
     )
     domain_loader = DataLoader(
-        SegmentationDataset(args.data_dir, aligned["val_domain"], augment=False),
+        datasets["val_domain"],
         batch_size=1, num_workers=args.num_workers,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -147,7 +175,12 @@ def main() -> int:
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items() if key != "resume_from"
         }
-        save_json(config_path, {
+        if args.arm == "direct_dino":
+            serialized_args.pop("presence_dir")
+        else:
+            serialized_args.pop("embedding_dir")
+            serialized_args.pop("augmented_dino_dir")
+        run_metadata: dict[str, object] = {
             **serialized_args,
             "pretrained_path": str(pretrained_dir), "pretrained_model": "nvidia/mit-b3",
             "pretrained_revision": pretrained_dir.name if pretrained_dir.parent.name == "snapshots" else None,
@@ -157,16 +190,39 @@ def main() -> int:
             )),
             "input_size": [1024, 1024], "num_classes": 8, "ignore_index": 255,
             "torch_version": torch.__version__, "transformers_version": transformers.__version__,
-            "presence_source": "Stage 02 predicted probabilities; train is in-sample prediction",
-            "presence_columns": ["Building", "Road", "Water", "Barren", "Vegetation", "Agricultural", "Vehicle"],
-            "split_counts": {key: len(rows) for key, rows in aligned.items()},
+            "loss": "multiclass Cross Entropy", "optimizer": "AdamW",
+            "scheduler": "CosineAnnealingLR", "gradient_checkpointing": True,
+            "conditioning_type": args.arm,
+            "trainable_parameter_count": sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
+            "conditioning_parameter_count": sum(
+                parameter.numel() for parameter in model.film.parameters()
+            ) if model.film is not None else 0,
+            "split_counts": split_counts,
             "split_sha256": {
-                split: sha256_file(args.data_dir / "splits" / f"{split}.txt") for split in aligned
+                split: sha256_file(args.data_dir / "splits" / f"{split}.txt") for split in split_counts
             },
-            "presence_csv_sha256": {
-                split: sha256_file(args.presence_dir / f"predictions_{split}.csv") for split in aligned
-            },
-        })
+        }
+        if args.arm == "direct_dino":
+            run_metadata.update({
+                "dino_source": "Stage 01 accepted Combined CLS || MeanPatch embeddings",
+                "dino_model": "facebook/dinov2-base",
+                "dino_revision": dino_store.base_metadata["resolved_revision"],
+                "dino_input_dimension": 1536,
+                "conditioning_architecture": "LayerNorm -> Linear 1536->256 -> GELU -> Linear 256->1536",
+                "film_channels": 768,
+                "augmentation_alignment": "same image ID and canonical D4 transform state",
+                "base_embedding_metadata_sha256": sha256_file(args.embedding_dir / "metadata.json"),
+                "augmented_embedding_metadata_sha256": sha256_file(args.augmented_dino_dir / "metadata.json"),
+            })
+        else:
+            run_metadata.update({
+                "presence_source": "Stage 02 predicted probabilities; train is in-sample prediction",
+                "presence_columns": ["Building", "Road", "Water", "Barren", "Vegetation", "Agricultural", "Vehicle"],
+                "presence_csv_sha256": {
+                    split: sha256_file(args.presence_dir / f"predictions_{split}.csv") for split in split_counts
+                },
+            })
+        save_json(config_path, run_metadata)
     else:
         config = json.loads(config_path.read_text(encoding="utf-8"))
         validate_resume_config(args, config)
@@ -193,7 +249,7 @@ def main() -> int:
         }
         missing = required - checkpoint.keys()
         if missing or checkpoint["schema_version"] != 1 or checkpoint["arm"] != args.arm:
-            raise ValueError(f"Invalid Stage 03 resume checkpoint; missing={sorted(missing)}")
+            raise ValueError(f"Invalid Stage 03/04 resume checkpoint; missing={sorted(missing)}")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -228,16 +284,17 @@ def main() -> int:
         loss_total = 0.0
         for _ in range(args.grad_accum):
             try:
-                pixels, target, probability, _ = next(iterator)
+                batch = next(iterator)
             except StopIteration:
                 iterator_start_generator_state = loader_generator.get_state()
                 iterator = iter(train_loader)
                 batches_in_iterator = 0
-                pixels, target, probability, _ = next(iterator)
+                batch = next(iterator)
             batches_in_iterator += 1
-            pixels, target, probability = pixels.to(device), target.to(device), probability.to(device)
+            pixels, target, conditioning = batch[:3]
+            pixels, target, conditioning = pixels.to(device), target.to(device), conditioning.to(device)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp):
-                logits = model(pixels, probability)
+                logits = model(pixels, conditioning)
                 loss = segmentation_loss(logits, target) / args.grad_accum
             if not torch.isfinite(loss):
                 raise ValueError(f"Non-finite loss at step {step}")
