@@ -1,0 +1,22 @@
+# Repository allowlist: ignore every root entry first.
+/*
+
+# Repository metadata and documentation.
+!/.gitignore
+!/README.md
+!/requirements.txt
+
+# Source code and command-line tools.
+!/src/
+!/tools/
+
+# Keep only the fixed split files and label definition under data/.
+!/data/
+/data/*
+!/data/Label.txt
+!/data/splits/
+
+# Generated Python and macOS files inside allowed directories.
+__pycache__/
+*.py[cod]
+.DS_Store
