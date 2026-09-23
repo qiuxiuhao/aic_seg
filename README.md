@@ -3,7 +3,9 @@
 ## 一、当前版本迭代情况与提升
 
 > 注1：当前为进行 baseline 级别的框架尝试，训练采用同一配置：AdamW、相同初始学习率、Weight decay、Scheduler、optimizer steps = 30000、常规多类别 Cross Entropy Loss。
+
 > 注2: 数据增强仅采用 水平翻转、垂直翻转、随机 0°/90°/180°/270° 旋转 这几种最简单的数据增强方式
+
 > 注3: 因时间和资源有限，不保证所有训练均已完全收敛稳定，旨在统一设置下进行架构调整效果对比。
 
 当前完成的 Stage 03 实验包含两个版本：
@@ -52,6 +54,8 @@ config.json
 history.json
 metrics.json
 ```
+
+使用当前训练入口新建的训练还会在每次验证后生成可续训的 `last.pt`。
 
 ## 二、部署运行流程
 
@@ -212,6 +216,7 @@ python -m tools.train_presence_conditioning \
   --eval-every 2000 \
   --batch-size 4 \
   --grad-accum 1 \
+  --num-workers 0 \
   --learning-rate 6e-5 \
   --weight-decay 0.01 \
   --seed 42 \
@@ -229,13 +234,70 @@ python -m tools.train_presence_conditioning \
   --eval-every 2000 \
   --batch-size 4 \
   --grad-accum 1 \
+  --num-workers 0 \
   --learning-rate 6e-5 \
   --weight-decay 0.01 \
   --seed 42 \
   --output-dir outputs/presence_conditioning/conditioned_b3_bs4
 ```
 
-### 9. 生成对比结果
+### 9. Stage 03 断点续训
+
+训练会在每次验证完成后更新输出目录中的 `last.pt`。该文件保存：
+
+```text
+模型参数
+优化器状态
+Scheduler 状态
+AMP GradScaler 状态
+当前 optimizer step
+最佳 mIoU 与最佳 step
+训练历史
+随机数状态
+DataLoader shuffle 状态与当前迭代位置
+```
+
+断点续训必须继续使用原输出目录和完全相同的训练参数。`best.pt` 只保存最佳模型参数，不用于断点续训。该方式只适用于由当前训练入口生成了 `last.pt` 的训练任务。
+
+v1 从最近一次完整验证点继续：
+
+```bash
+python -m tools.train_presence_conditioning \
+  --arm control \
+  --device cuda \
+  --amp \
+  --max-steps 30000 \
+  --eval-every 2000 \
+  --batch-size 4 \
+  --grad-accum 1 \
+  --num-workers 0 \
+  --learning-rate 6e-5 \
+  --weight-decay 0.01 \
+  --seed 42 \
+  --output-dir outputs/presence_conditioning/control_b3_bs4 \
+  --resume-from outputs/presence_conditioning/control_b3_bs4/last.pt
+```
+
+v2 从最近一次完整验证点继续：
+
+```bash
+python -m tools.train_presence_conditioning \
+  --arm conditioned \
+  --device cuda \
+  --amp \
+  --max-steps 30000 \
+  --eval-every 2000 \
+  --batch-size 4 \
+  --grad-accum 1 \
+  --num-workers 0 \
+  --learning-rate 6e-5 \
+  --weight-decay 0.01 \
+  --seed 42 \
+  --output-dir outputs/presence_conditioning/conditioned_b3_bs4 \
+  --resume-from outputs/presence_conditioning/conditioned_b3_bs4/last.pt
+```
+
+### 10. 生成对比结果
 
 ```bash
 python -m tools.compare_presence_conditioning \

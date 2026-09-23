@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
+import random
 from pathlib import Path
 
+import numpy as np
 import torch
 import transformers
 from torch.utils.data import DataLoader
@@ -36,17 +39,78 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=6e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--amp", action="store_true", help="CUDA float16 autocast; use identically for both arms")
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="Resume the same run from its full-state last.pt checkpoint",
+    )
     args = parser.parse_args()
     for name in ("max_steps", "eval_every", "batch_size", "grad_accum"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.num_workers < 0 or args.learning_rate <= 0 or args.weight_decay < 0:
         parser.error("Invalid worker count, learning rate or weight decay")
-    if args.output_dir.resolve().exists():
+    if args.resume_from is None and args.output_dir.resolve().exists():
         parser.error("Output directory already exists; use a fresh run directory")
+    if args.resume_from is not None:
+        if not args.output_dir.resolve().is_dir():
+            parser.error("Resume requires the existing run output directory")
+        if not args.resume_from.resolve().is_file():
+            parser.error(f"Resume checkpoint does not exist: {args.resume_from}")
+        if args.resume_from.resolve().parent != args.output_dir.resolve():
+            parser.error("Resume checkpoint must belong to --output-dir")
+        if args.num_workers != 0:
+            parser.error("Exact Stage 03 resume requires --num-workers 0")
     if args.data_dir.resolve() in args.output_dir.resolve().parents:
         parser.error("Output directory cannot be under read-only data/")
     return args
+
+
+def numpy_rng_state() -> dict[str, object]:
+    """Store NumPy RNG state using only checkpoint-safe Python values."""
+    name, keys, position, has_gauss, cached_gaussian = np.random.get_state()
+    return {
+        "name": name,
+        "keys": keys.tolist(),
+        "position": position,
+        "has_gauss": has_gauss,
+        "cached_gaussian": cached_gaussian,
+    }
+
+
+def restore_numpy_rng_state(state: dict[str, object]) -> None:
+    np.random.set_state((
+        str(state["name"]),
+        np.asarray(state["keys"], dtype=np.uint32),
+        int(state["position"]),
+        int(state["has_gauss"]),
+        float(state["cached_gaussian"]),
+    ))
+
+
+def save_resume_checkpoint(path: Path, state: dict[str, object]) -> None:
+    """Atomically replace the full-state checkpoint used for interruption recovery."""
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(state, temporary)
+    temporary.replace(path)
+
+
+def validate_resume_config(args: argparse.Namespace, config: dict[str, object]) -> None:
+    """Reject protocol changes when continuing an existing Stage 03 run."""
+    keys = (
+        "arm", "data_dir", "presence_dir", "pretrained_dir", "cache_dir", "hf_endpoint",
+        "device", "seed", "max_steps", "eval_every", "batch_size", "grad_accum",
+        "num_workers", "learning_rate", "weight_decay", "amp",
+    )
+    for key in keys:
+        actual = getattr(args, key)
+        if isinstance(actual, Path):
+            actual = str(actual)
+        if config.get(key) != actual:
+            raise ValueError(
+                f"Resume protocol differs at {key}: existing={config.get(key)!r}, requested={actual!r}"
+            )
 
 
 def main() -> int:
@@ -76,32 +140,89 @@ def main() -> int:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_steps)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
-    args.output_dir.mkdir(parents=True, exist_ok=False)
-    save_json(args.output_dir / "config.json", {
-        **{key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
-        "pretrained_path": str(pretrained_dir), "pretrained_model": "nvidia/mit-b3",
-        "pretrained_revision": pretrained_dir.name if pretrained_dir.parent.name == "snapshots" else None,
-        "pretrained_sha256": sha256_file(next(
+    config_path = args.output_dir / "config.json"
+    if args.resume_from is None:
+        args.output_dir.mkdir(parents=True, exist_ok=False)
+        serialized_args = {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items() if key != "resume_from"
+        }
+        save_json(config_path, {
+            **serialized_args,
+            "pretrained_path": str(pretrained_dir), "pretrained_model": "nvidia/mit-b3",
+            "pretrained_revision": pretrained_dir.name if pretrained_dir.parent.name == "snapshots" else None,
+            "pretrained_sha256": sha256_file(next(
+                pretrained_dir / name for name in ("model.safetensors", "pytorch_model.bin")
+                if (pretrained_dir / name).is_file()
+            )),
+            "input_size": [1024, 1024], "num_classes": 8, "ignore_index": 255,
+            "torch_version": torch.__version__, "transformers_version": transformers.__version__,
+            "presence_source": "Stage 02 predicted probabilities; train is in-sample prediction",
+            "presence_columns": ["Building", "Road", "Water", "Barren", "Vegetation", "Agricultural", "Vehicle"],
+            "split_counts": {key: len(rows) for key, rows in aligned.items()},
+            "split_sha256": {
+                split: sha256_file(args.data_dir / "splits" / f"{split}.txt") for split in aligned
+            },
+            "presence_csv_sha256": {
+                split: sha256_file(args.presence_dir / f"predictions_{split}.csv") for split in aligned
+            },
+        })
+    else:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        validate_resume_config(args, config)
+        current_sha256 = sha256_file(next(
             pretrained_dir / name for name in ("model.safetensors", "pytorch_model.bin")
             if (pretrained_dir / name).is_file()
-        )),
-        "input_size": [1024, 1024], "num_classes": 8, "ignore_index": 255,
-        "torch_version": torch.__version__, "transformers_version": transformers.__version__,
-        "presence_source": "Stage 02 predicted probabilities; train is in-sample prediction",
-        "presence_columns": ["Building", "Road", "Water", "Barren", "Vegetation", "Agricultural", "Vehicle"],
-        "split_counts": {key: len(rows) for key, rows in aligned.items()},
-        "split_sha256": {
-            split: sha256_file(args.data_dir / "splits" / f"{split}.txt") for split in aligned
-        },
-        "presence_csv_sha256": {
-            split: sha256_file(args.presence_dir / f"predictions_{split}.csv") for split in aligned
-        },
-    })
+        ))
+        if config.get("pretrained_sha256") != current_sha256:
+            raise ValueError("Resume pretrained checkpoint SHA256 differs from the original run")
     best_miou = -1.0
     best_step = 0
-    iterator = iter(train_loader)
     history: list[dict[str, float | int | None]] = []
-    for step in tqdm(range(1, args.max_steps + 1), desc=f"Training {args.arm}"):
+    start_step = 0
+    iterator_start_generator_state = loader_generator.get_state()
+    iterator = iter(train_loader)
+    batches_in_iterator = 0
+    if args.resume_from is not None:
+        checkpoint = torch.load(args.resume_from, map_location="cpu", weights_only=True)
+        required = {
+            "schema_version", "arm", "step", "model", "optimizer", "scheduler", "scaler",
+            "best_miou", "best_step", "history", "python_rng_state", "numpy_rng_state",
+            "torch_rng_state", "loader_generator_state", "iterator_start_generator_state",
+            "batches_in_iterator",
+        }
+        missing = required - checkpoint.keys()
+        if missing or checkpoint["schema_version"] != 1 or checkpoint["arm"] != args.arm:
+            raise ValueError(f"Invalid Stage 03 resume checkpoint; missing={sorted(missing)}")
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        scaler.load_state_dict(checkpoint["scaler"])
+        best_miou = float(checkpoint["best_miou"])
+        best_step = int(checkpoint["best_step"])
+        history = list(checkpoint["history"])
+        start_step = int(checkpoint["step"])
+        if start_step >= args.max_steps:
+            raise ValueError(f"Run already reached max_steps={args.max_steps}")
+
+        iterator_start_generator_state = checkpoint["iterator_start_generator_state"]
+        batches_in_iterator = int(checkpoint["batches_in_iterator"])
+        loader_generator.set_state(iterator_start_generator_state)
+        iterator = iter(train_loader)
+        for _ in range(batches_in_iterator):
+            try:
+                next(iterator)
+            except StopIteration as error:
+                raise ValueError("Saved train iterator position exceeds the loader length") from error
+        loader_generator.set_state(checkpoint["loader_generator_state"])
+        random.setstate(checkpoint["python_rng_state"])
+        restore_numpy_rng_state(checkpoint["numpy_rng_state"])
+        torch.set_rng_state(checkpoint["torch_rng_state"])
+        if device.type == "cuda" and "cuda_rng_state_all" in checkpoint:
+            torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
+        print(f"Resumed {args.arm} from step {start_step}", flush=True)
+
+    for step in tqdm(range(start_step + 1, args.max_steps + 1), desc=f"Training {args.arm}"):
         model.train()
         optimizer.zero_grad(set_to_none=True)
         loss_total = 0.0
@@ -109,8 +230,11 @@ def main() -> int:
             try:
                 pixels, target, probability, _ = next(iterator)
             except StopIteration:
+                iterator_start_generator_state = loader_generator.get_state()
                 iterator = iter(train_loader)
+                batches_in_iterator = 0
                 pixels, target, probability, _ = next(iterator)
+            batches_in_iterator += 1
             pixels, target, probability = pixels.to(device), target.to(device), probability.to(device)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp):
                 logits = model(pixels, probability)
@@ -133,6 +257,25 @@ def main() -> int:
             if score > best_miou:
                 best_miou, best_step = score, step
                 torch.save({"model": model.state_dict(), "step": step, "arm": args.arm}, args.output_dir / "best.pt")
+            save_resume_checkpoint(args.output_dir / "last.pt", {
+                "schema_version": 1,
+                "arm": args.arm,
+                "step": step,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "best_miou": best_miou,
+                "best_step": best_step,
+                "history": history,
+                "python_rng_state": random.getstate(),
+                "numpy_rng_state": numpy_rng_state(),
+                "torch_rng_state": torch.get_rng_state(),
+                "cuda_rng_state_all": torch.cuda.get_rng_state_all() if device.type == "cuda" else [],
+                "loader_generator_state": loader_generator.get_state(),
+                "iterator_start_generator_state": iterator_start_generator_state,
+                "batches_in_iterator": batches_in_iterator,
+            })
     checkpoint = torch.load(args.output_dir / "best.pt", map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model"])
     metrics = {
