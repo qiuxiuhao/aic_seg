@@ -74,8 +74,31 @@ def collect_test_images(image_dir: Path, limit: int | None = None) -> list[Path]
     return paths if limit is None else paths[:limit]
 
 
-class V3TestDataset(Dataset[tuple[torch.Tensor, torch.Tensor, str]]):
-    """Prepare the same full image for SegFormer and frozen DINOv2 r0 inference."""
+def _segmentation_tensor(rgb: np.ndarray) -> torch.Tensor:
+    pixels = (rgb.astype(np.float32) / 255.0 - MEAN) / STD
+    return torch.from_numpy(np.ascontiguousarray(pixels.transpose(2, 0, 1)))
+
+
+class SegmentationTestDataset(Dataset[tuple[torch.Tensor, str]]):
+    """Prepare complete test images for the v1 pixel-only model."""
+
+    def __init__(self, paths: list[Path]) -> None:
+        if not paths:
+            raise ValueError("Test dataset is empty")
+        self.paths = paths
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, str]:
+        path = self.paths[index]
+        with Image.open(path) as image:
+            rgb = np.asarray(image, dtype=np.uint8).copy()
+        return _segmentation_tensor(rgb), path.name
+
+
+class DinoTestDataset(Dataset[tuple[torch.Tensor, torch.Tensor, str]]):
+    """Prepare the same complete image for segmentation and frozen DINOv2."""
 
     def __init__(self, paths: list[Path], processor: ProcessorConfig) -> None:
         if not paths:
@@ -90,10 +113,12 @@ class V3TestDataset(Dataset[tuple[torch.Tensor, torch.Tensor, str]]):
         path = self.paths[index]
         with Image.open(path) as image:
             rgb = np.asarray(image, dtype=np.uint8).copy()
-        pixels = (rgb.astype(np.float32) / 255.0 - MEAN) / STD
-        segmentation = torch.from_numpy(np.ascontiguousarray(pixels.transpose(2, 0, 1)))
         dino = preprocess_rgb(rgb, self.processor)
-        return segmentation, dino, path.name
+        return _segmentation_tensor(rgb), dino, path.name
+
+
+# Backward-compatible name used by the original v3-only inference entry point.
+V3TestDataset = DinoTestDataset
 
 
 def save_official_prediction(prediction: np.ndarray, target: Path) -> Counter[int]:
